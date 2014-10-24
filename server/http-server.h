@@ -12,21 +12,21 @@
 
 struct _SeafileSession;
 
-typedef struct TokenInfo {
-    char *repo_id;
-    char *email;
-    long expire_time;
-} TokenInfo;
-
 typedef struct HttpServer {
     char *bind_addr;
     int bind_port;
     evbase_t *evbase;
     evhtp_t *evhtp;
     pthread_t thread_id;
+
     GHashTable *token_cache;
-    pthread_mutex_t token_cache_lock;
-    event_t *token_timer;
+    pthread_mutex_t token_cache_lock; /* token -> username */
+
+    GHashTable *perm_cache;
+    pthread_mutex_t perm_cache_lock; /* repo_id:username -> permission */
+
+    event_t *reap_timer;
+
     struct _SeafileSession *seaf_session;
 } HttpServer;
 

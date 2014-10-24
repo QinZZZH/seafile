@@ -12,8 +12,20 @@
 
 #define DEFAULT_BIND_HOST "0.0.0.0"
 #define DEFAULT_BIND_PORT 8083
+#define DEFAULT_THREADS 50
 #define CLEANING_INTERVAL_MSEC 300	/* 5 minutes */
 #define TOKEN_EXPIRE_TIME 7200	    /* 2 hour */
+
+typedef struct TokenInfo {
+    char *repo_id;
+    char *email;
+    gint64 expire_time;
+} TokenInfo;
+
+typedef struct PermInfo {
+    char *perm;
+    gint64 expire_time;
+} PermInfo;
 
 const char *GROUP_NAME = "httpserver";
 const char *HOST = "host";
@@ -28,7 +40,7 @@ const char *HEAD_COMMIT_OPER_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}
 const char *COMMIT_OPER_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/commit/[\\da-z]{40}";
 const char *PUT_COMMIT_INFO_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/commit/[\\da-z]{40}";
 const char *GET_FS_OBJ_ID_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/fs-id-list/.*";
-const char *BLOCKT_OPER_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/block/[\\da-z]{40}";
+const char *BLOCK_OPER_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/block/[\\da-z]{40}";
 const char *POST_CHECK_FS_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/check-fs";
 const char *POST_CHECK_BLOCK_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/check-blocks";
 const char *POST_RECV_FS_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/recv-fs";
@@ -70,47 +82,53 @@ load_http_config (HttpServer *htp_server, SeafileSession *session)
     }
 }
 
-static evhtp_res
-validate_token_cb (evhtp_request_t * req, void * arg)
+static int
+validate_token (HttpServer *htp_server, evhtp_request_t *req,
+                const char *repo_id, char **username)
 {
+    char *email = NULL;
+    TokenInfo *token_info;
+
     const char *token = evhtp_kv_find (req->headers_in, "Seafile-Repo-Token");
     if (token == NULL) {
         evhtp_send_reply (req, EVHTP_RES_BADREQ);
         return EVHTP_RES_BADREQ;
     }
 
-    const char *repo_id = NULL;
-    char *email = NULL;
-    TokenInfo *token_info = NULL;
-
-    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
-    repo_id = parts[1];
-    HttpServer *htp_server = arg;
-
     pthread_mutex_lock (&htp_server->token_cache_lock);
 
-    if (g_hash_table_lookup (htp_server->token_cache, token) == NULL) {
-        email = seaf_repo_manager_get_email_by_token (htp_server->seaf_session->repo_mgr,
-                                                      repo_id, token);
-        if (email == NULL) {
-            pthread_mutex_unlock (&htp_server->token_cache_lock);
-            g_strfreev (parts);
-            return EVHTP_RES_FORBIDDEN;
-        }
-
-        token_info = g_new0 (TokenInfo, 1);
-        token_info->repo_id = g_strdup (repo_id);
-        token_info->expire_time = (long)time(NULL) + TOKEN_EXPIRE_TIME;
-        token_info->email = email;
-
-        g_hash_table_insert (htp_server->token_cache, g_strdup (token), token_info);
+    token_info = g_hash_table_lookup (htp_server->token_cache, token);
+    if (token_info) {
+        *username = g_strdup(token_info->email);
+        pthread_mutex_unlock (&htp_server->token_cache_lock);
+        return EVHTP_RES_OK;
     }
 
     pthread_mutex_unlock (&htp_server->token_cache_lock);
 
-    g_strfreev (parts);
+    email = seaf_repo_manager_get_email_by_token (htp_server->seaf_session->repo_mgr,
+                                                  repo_id, token);
+    if (email == NULL)
+        return EVHTP_RES_FORBIDDEN;
 
+    token_info = g_new0 (TokenInfo, 1);
+    token_info->repo_id = g_strdup (repo_id);
+    token_info->expire_time = (gint64)time(NULL) + TOKEN_EXPIRE_TIME;
+    token_info->email = email;
+
+    pthread_mutex_lock (&htp_server->token_cache_lock);
+    g_hash_table_insert (htp_server->token_cache, g_strdup (token), token_info);
+    pthread_mutex_unlock (&htp_server->token_cache_lock);
+
+    *username = g_strdup(email);
     return EVHTP_RES_OK;
+}
+
+static int
+check_permission (HttpServer *htp_server, const char *repo_id, const char *username,
+                  gboolean skip_cache)
+{
+
 }
 
 static void
@@ -129,47 +147,19 @@ get_check_permission_cb (evhtp_request_t *req, void *arg)
         return;
     }
 
-    int token_status = validate_token_cb (req, arg);
-    if (token_status != EVHTP_RES_OK) {
-        evhtp_send_reply (req, token_status);
-        return;
-    }
-
-    TokenInfo *token_info = NULL;
-    char *email = NULL;
     char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
     char *repo_id = parts[1];
     HttpServer *htp_server = (HttpServer *)arg;
-    const char *token = evhtp_kv_find (req->headers_in, "Seafile-Repo-Token");
+    char *username = NULL;
 
-    pthread_mutex_lock (&htp_server->token_cache_lock);
-
-    token_info = g_hash_table_lookup (htp_server->token_cache, token);
-    // recheck token from db, in case token expired
-    if (!token_info) {
-        email = seaf_repo_manager_get_email_by_token (htp_server->seaf_session->repo_mgr,
-                                                      repo_id, token);
-        if (email == NULL) {
-            pthread_mutex_unlock (&htp_server->token_cache_lock);
-            g_strfreev (parts);
-            evhtp_send_reply (req, EVHTP_RES_FORBIDDEN);
-            return;
-        }
-
-        token_info = g_new0 (TokenInfo, 1);
-        token_info->repo_id = g_strdup (repo_id);
-        token_info->expire_time = (long)time(NULL) + TOKEN_EXPIRE_TIME;
-        token_info->email = email;
-
-        g_hash_table_insert (htp_server->token_cache, g_strdup (token), token_info);
-    } else {
-        email = token_info->email;
+    int token_status = validate_token_cb (htp_server, req, repo_id, &username);
+    if (token_status != EVHTP_RES_OK) {
+        evhtp_send_reply (req, token_status);
+        goto out;
     }
 
-    pthread_mutex_unlock (&htp_server->token_cache_lock);
-
-    char *perm = seaf_repo_manager_check_permission (htp_server->seaf_session->repo_mgr,
-                                                     repo_id, email, NULL);
+    char *perm = seaf_repo_manager_check_permission (seaf->repo_mgr,
+                                                     repo_id, username, NULL);
     if (!perm ||
         (strcmp (perm, "r") == 0 && strcmp (op, "upload") == 0)) {
         evhtp_send_reply (req, EVHTP_RES_FORBIDDEN);
@@ -191,7 +181,7 @@ get_protocol_cb (evhtp_request_t *req, void *arg)
 }
 
 static void
-get_check_quoto_cb (evhtp_request_t *req, void *arg)
+get_check_quota_cb (evhtp_request_t *req, void *arg)
 {
     const char *delta = evhtp_kv_find (req->uri->query, "delta");
     long int delta_num;
@@ -1051,7 +1041,7 @@ http_request_init (HttpServer *htp_server)
                   NULL);
 
     evhtp_set_regex_cb (htp_server->evhtp,
-                        GET_CHECK_QUOTA_REGEX, get_check_quoto_cb,
+                        GET_CHECK_QUOTA_REGEX, get_check_quota_cb,
                         htp_server);
 
     evhtp_set_regex_cb (htp_server->evhtp,
@@ -1071,7 +1061,7 @@ http_request_init (HttpServer *htp_server)
                         htp_server);
 
     evhtp_set_regex_cb (htp_server->evhtp,
-                        BLOCKT_OPER_REGEX, block_oper_cb,
+                        BLOCK_OPER_REGEX, block_oper_cb,
                         htp_server);
 
     evhtp_set_regex_cb (htp_server->evhtp,
@@ -1107,7 +1097,7 @@ is_token_expire (gpointer key, gpointer value, gpointer arg)
 {
     TokenInfo *token_info = (TokenInfo *)value;
 
-    if(token_info && token_info->expire_time >= (long)time(NULL)) {
+    if(token_info && token_info->expire_time >= (gint64)time(NULL)) {
         return TRUE;
     }
 
@@ -1115,13 +1105,37 @@ is_token_expire (gpointer key, gpointer value, gpointer arg)
 }
 
 static void
-remove_expire_token_cb (evutil_socket_t sock, short type, void *data)
+perm_cache_value_free (gpointer data)
+{
+    PermInfo *perm_info = data;
+    g_free (perm_info->perm);
+    g_free (perm_info);
+}
+
+static gboolean
+is_perm_expire (gpointer key, gpointer value, gpointer arg)
+{
+    PermInfo *perm_info = (PermInfo *)value;
+
+    if(perm_info && perm_info->expire_time >= (gint64)time(NULL)) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void
+remove_expire_cache_cb (evutil_socket_t sock, short type, void *data)
 {
     HttpServer *htp_server = data;
 
     pthread_mutex_lock (&htp_server->token_cache_lock);
     g_hash_table_foreach_remove (htp_server->token_cache, is_token_expire, NULL);
     pthread_mutex_unlock (&htp_server->token_cache_lock);
+
+    pthread_mutex_lock (&htp_server->perm_cache_lock);
+    g_hash_table_foreach_remove (htp_server->perm_cache, is_perm_expire, NULL);
+    pthread_mutex_unlock (&htp_server->perm_cache_lock);
 }
 
 static void *
@@ -1142,14 +1156,15 @@ http_server_run (void *arg)
 
     http_request_init (htp_server);
 
-    evhtp_use_threads (htp_server->evhtp, NULL, 50, NULL);
+    evhtp_use_threads (htp_server->evhtp, NULL, DEFAULT_THREADS, NULL);
 
     struct timeval tv;
     tv.tv_sec = CLEANING_INTERVAL_MSEC;
     tv.tv_usec = 0;
-    htp_server->token_timer = evtimer_new (htp_server->evbase, remove_expire_token_cb,
-                                           htp_server);
-    evtimer_add (htp_server->token_timer, &tv);
+    htp_server->reap_timer = evtimer_new (htp_server->evbase,
+                                          remove_expire_cache_cb,
+                                          htp_server);
+    evtimer_add (htp_server->reap_timer, &tv);
 
     event_base_loop (htp_server->evbase, 0);
     seaf_http_server_release (htp_server);
@@ -1169,12 +1184,14 @@ seaf_http_server_new (struct _SeafileSession *session)
 
     session->http_server = http_server;
     http_server->seaf_session = session;
+
     http_server->token_cache = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                       g_free, token_cache_value_free);
-    pthread_mutexattr_t mutex_attr;
-    pthread_mutexattr_init(&mutex_attr);
-    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE_NP);
-    pthread_mutex_init (&http_server->token_cache_lock, &mutex_attr);
+    pthread_mutex_init (&http_server->token_cache_lock, NULL);
+
+    http_server->perm_cache = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                     g_free, perm_cache_value_free);
+    pthread_mutex_init (&http_server->perm_cache_lock, NULL);
 
     return http_server;
 }
@@ -1195,8 +1212,11 @@ void seaf_http_server_release (HttpServer *htp_server)
         if (htp_server->token_cache) {
             g_hash_table_destroy (htp_server->token_cache);
         }
-        if (htp_server->token_timer) {
-            event_del (htp_server->token_timer);
+        if (htp_server->perm_cache) {
+            g_hash_table_destroy (htp_server->perm_cache);
+        }
+        if (htp_server->reap_timer) {
+            event_del (htp_server->reap_timer);
         }
     }
 }
@@ -1207,23 +1227,7 @@ seaf_http_server_start (HttpServer *htp_server)
    int ret = pthread_create (&htp_server->thread_id, NULL, http_server_run, htp_server);
    if (ret != 0)
        return -1;
-   else
-       return 0;
-}
 
-int
-seaf_http_server_join (HttpServer *htp_server)
-{
-    if (htp_server->thread_id <= 0)
-        return -1;
-    return pthread_join (htp_server->thread_id, NULL);
+   pthread_detach (http_server->thread_id);
+   return 0;
 }
-
-int
-seaf_http_server_detach (HttpServer *htp_server)
-{
-    if (htp_server->thread_id <= 0)
-        return -1;
-    return pthread_detach (htp_server->thread_id);
-}
-
