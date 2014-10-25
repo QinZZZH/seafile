@@ -195,6 +195,7 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
     FSEventStreamRef stream;
 
     /* Create the stream, passing in a callback */
+    seaf_debug("Use kFSEventStreamCreateFlagWatchRoot\n");
     struct FSEventStreamContext ctx = {0, monitor, NULL, NULL, NULL};
     stream = FSEventStreamCreate(kCFAllocatorDefault,
                                  stream_callback,
@@ -202,7 +203,7 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
                                  pathsToWatch,
                                  kFSEventStreamEventIdSinceNow,
                                  latency,
-                                 kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
+                                 kFSEventStreamCreateFlagWatchRoot
                                  );
 
     CFRelease (mypaths[0]);
