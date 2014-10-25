@@ -185,13 +185,13 @@ static FSEventStreamRef
 add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
 {
     SeafWTMonitorPriv *priv = monitor->priv;
-    const char *path = worktree;
     RepoWatchInfo *info;
-    double latency = 0.25; /* unit: second */
+    double latency = 1; /* unit: second */
 
-    CFStringRef mypath = CFStringCreateWithCString (kCFAllocatorDefault,
-                                                    path, kCFStringEncodingUTF8);
-    CFArrayRef pathsToWatch = CFArrayCreate(NULL, (const void **)&mypath, 1, NULL);
+    CFStringRef mypaths[1];
+    mypaths[0] = CFStringCreateWithCString (kCFAllocatorDefault,
+                                                    worktree, kCFStringEncodingUTF8);
+    CFArrayRef pathsToWatch = CFArrayCreate(NULL, (const void **)mypaths, 1, NULL);
     FSEventStreamRef stream;
 
     /* Create the stream, passing in a callback */
@@ -202,10 +202,10 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
                                  pathsToWatch,
                                  kFSEventStreamEventIdSinceNow,
                                  latency,
-                                 kFSEventStreamCreateFlagFileEvents /* deprecated OSX 10.6 support*/
-        );
+                                 kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
+                                 );
 
-    CFRelease (mypath);
+    CFRelease (mypaths[0]);
     CFRelease (pathsToWatch);
 
     if (!stream) {
